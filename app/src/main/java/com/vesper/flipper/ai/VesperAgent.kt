@@ -681,9 +681,8 @@ class VesperAgent @Inject constructor(
         persistenceMutex.withLock {
             settingsStore.setLastChatSessionId(snapshot.sessionId)
             chatDao.deleteSession(snapshot.sessionId)
-            snapshot.messages.forEach { message ->
-                chatDao.insert(message.toEntity(snapshot.sessionId))
-            }
+            val entities = snapshot.messages.map { it.toEntity(snapshot.sessionId) }
+            chatDao.insertAll(entities)
         }
     }
 
