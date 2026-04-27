@@ -461,21 +461,15 @@ async function startMentraIntegration() {
             const lowerText = rawText.toLowerCase();
 
             // ── Wake word detection ──────────────────────────────
-            const wakePatterns = [
-              /^hey\s+vesper[\s,.:!]*(.*)$/i,
-              /^vesper[\s,.:!]*(.*)$/i,
-            ];
+            const wakePattern = /^(?:hey\s+)?vesper[\s,.:!]*(.*)$/i;
 
             let command: string | null = null;
             let isWakeTriggered = false;
 
-            for (const pattern of wakePatterns) {
-              const match = rawText.match(pattern);
-              if (match) {
-                isWakeTriggered = true;
-                command = match[1]?.trim() || null;
-                break;
-              }
+            const match = rawText.match(wakePattern);
+            if (match) {
+              isWakeTriggered = true;
+              command = match[1]?.trim() || null;
             }
 
             if (isWakeTriggered) {
