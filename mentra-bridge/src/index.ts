@@ -154,7 +154,7 @@ function pick(arr: string[]): string {
   return arr[Math.floor(Math.random() * arr.length)];
 }
 
-function getWakeGreeting(hasCommand: boolean): string {
+export function getWakeGreeting(hasCommand: boolean): string {
   const now = Date.now();
   const timeSinceLastWake = now - lastWakeTimestamp;
   const isFirstWake = wakeCount === 0;
@@ -181,9 +181,11 @@ function getWakeGreeting(hasCommand: boolean): string {
 // ==================== WebSocket Relay Server ====================
 
 const PORT = parseInt(process.env.PORT || "8089", 10);
-const wss = new WebSocketServer({ port: PORT });
+export const wss = process.env.NODE_ENV === "test" ? null : new WebSocketServer({ port: PORT });
 
-console.log(`V3SP3R Glasses Bridge running on port ${PORT}`);
+if (wss) {
+  console.log(`V3SP3R Glasses Bridge running on port ${PORT}`);
+}
 
 // ==================== Heartbeat (keeps connections alive through proxies) ====================
 
@@ -193,68 +195,74 @@ function heartbeat(this: WebSocket & { isAlive?: boolean }) {
   this.isAlive = true;
 }
 
-const heartbeatTimer = setInterval(() => {
+const heartbeatTimer = wss ? setInterval(() => {
+  if (!wss) return;
   for (const ws of wss.clients) {
     const sock = ws as WebSocket & { isAlive?: boolean };
     if (sock.isAlive === false) {
       console.log("Terminating unresponsive client");
       clients.delete(ws);
-      return ws.terminate();
+      ws.terminate();
+      continue;
     }
     sock.isAlive = false;
     ws.ping();
   }
-}, HEARTBEAT_INTERVAL_MS);
+}, HEARTBEAT_INTERVAL_MS) : null;
 
-wss.on("close", () => clearInterval(heartbeatTimer));
-
-wss.on("connection", (ws, req) => {
-  const clientId = req.headers["x-vesper-client"] as string | undefined;
-  const clientType = clientId === "v3sp3r-android" ? "vesper" : "unknown";
-
-  const client: ConnectedClient = {
-    ws,
-    type: clientType as "glasses" | "vesper" | "unknown",
-    connectedAt: Date.now(),
-  };
-  clients.set(ws, client);
-  (ws as WebSocket & { isAlive?: boolean }).isAlive = true;
-  ws.on("pong", heartbeat);
-
-  console.log(
-    `Client connected: ${client.type} (${clients.size} total) from ${req.socket.remoteAddress}`
-  );
-
-  ws.on("message", (data) => {
-    try {
-      const message: GlassesMessage = JSON.parse(data.toString());
-      handleMessage(ws, message);
-    } catch (e) {
-      console.warn("Invalid message:", (e as Error).message);
-    }
+if (wss) {
+  wss.on("close", () => {
+    if (heartbeatTimer) clearInterval(heartbeatTimer);
   });
 
-  ws.on("close", () => {
-    clients.delete(ws);
-    console.log(`Client disconnected (${clients.size} remaining)`);
-  });
+  wss.on("connection", (ws, req) => {
+    const clientId = req.headers["x-vesper-client"] as string | undefined;
+    const clientType = clientId === "v3sp3r-android" ? "vesper" : "unknown";
 
-  ws.on("error", (err) => {
-    console.error("WebSocket error:", err.message);
-    clients.delete(ws);
-  });
+    const client: ConnectedClient = {
+      ws,
+      type: clientType as "glasses" | "vesper" | "unknown",
+      connectedAt: Date.now(),
+    };
+    clients.set(ws, client);
+    (ws as WebSocket & { isAlive?: boolean }).isAlive = true;
+    ws.on("pong", heartbeat);
 
-  ws.send(
-    JSON.stringify({
-      type: "STATUS_UPDATE",
-      text: "Connected to V3SP3R Glasses Bridge",
-      metadata: {
-        glasses_connected: getGlassesClients().length.toString(),
-        vesper_connected: getVesperClients().length.toString(),
-      },
-    } satisfies GlassesMessage)
-  );
-});
+    console.log(
+      `Client connected: ${client.type} (${clients.size} total) from ${req.socket.remoteAddress}`
+    );
+
+    ws.on("message", (data) => {
+      try {
+        const message: GlassesMessage = JSON.parse(data.toString());
+        handleMessage(ws, message);
+      } catch (e) {
+        console.warn("Invalid message:", (e as Error).message);
+      }
+    });
+
+    ws.on("close", () => {
+      clients.delete(ws);
+      console.log(`Client disconnected (${clients.size} remaining)`);
+    });
+
+    ws.on("error", (err) => {
+      console.error("WebSocket error:", err.message);
+      clients.delete(ws);
+    });
+
+    ws.send(
+      JSON.stringify({
+        type: "STATUS_UPDATE",
+        text: "Connected to V3SP3R Glasses Bridge",
+        metadata: {
+          glasses_connected: getGlassesClients().length.toString(),
+          vesper_connected: getVesperClients().length.toString(),
+        },
+      } satisfies GlassesMessage)
+    );
+  });
+}
 
 function handleMessage(sender: WebSocket, message: GlassesMessage) {
   const client = clients.get(sender);
@@ -729,7 +737,7 @@ async function startMentraIntegration() {
 }
 
 /** Check if text contains a vision trigger and capture if so. */
-function checkVisionTrigger(session: any, text: string) {
+export function checkVisionTrigger(session: any, text: string) {
   const visionTriggers = [
     // Explicit photo requests
     "take a photo", "take a picture", "capture this", "screenshot",
@@ -890,16 +898,20 @@ async function speakWithEchoGuard(session: any, text: string) {
  * Check if a transcription looks like an echo of recent TTS output.
  * Compares normalized text similarity.
  */
-function isLikelyTtsEcho(transcription: string): boolean {
-  if (!lastSpokenText) return false;
+export function isLikelyTtsEcho(transcription: string, spokenTextOverride?: string): boolean {
+  const targetSpoken = spokenTextOverride !== undefined ? spokenTextOverride : lastSpokenText;
+  if (!targetSpoken) return false;
   const normalized = transcription.toLowerCase().replace(/[^a-z0-9\s]/g, "").trim();
   if (!normalized) return false;
+  const targetSpokenNorm = targetSpoken.toLowerCase().replace(/[^a-z0-9\s]/g, "").trim();
+  if (!targetSpokenNorm) return false;
+
   // Check if the transcription is a substring of what was spoken or vice versa
-  if (lastSpokenText.includes(normalized) || normalized.includes(lastSpokenText)) {
+  if (targetSpokenNorm.includes(normalized) || normalized.includes(targetSpokenNorm)) {
     return true;
   }
   // Check word overlap — if >60% of words match, it's an echo
-  const spokenWords = new Set(lastSpokenText.split(/\s+/));
+  const spokenWords = new Set(targetSpokenNorm.split(/\s+/));
   const transWords = normalized.split(/\s+/);
   if (transWords.length === 0) return false;
   const overlap = transWords.filter(w => spokenWords.has(w)).length;
@@ -946,31 +958,33 @@ async function handleMentraResponse(session: any, message: GlassesMessage) {
   }
 }
 
-// Start MentraOS integration (non-blocking — falls back to relay-only mode)
-startMentraIntegration();
+if (process.env.NODE_ENV !== "test") {
+  // Start MentraOS integration (non-blocking — falls back to relay-only mode)
+  startMentraIntegration();
 
-// ==================== Health Check ====================
+  // ==================== Health Check ====================
 
-const HTTP_PORT = parseInt(process.env.HTTP_PORT || "8088", 10);
+  const HTTP_PORT = parseInt(process.env.HTTP_PORT || "8088", 10);
 
-const httpServer = createServer((req, res) => {
-  if (req.url === "/health") {
-    res.writeHead(200, { "Content-Type": "application/json" });
-    res.end(
-      JSON.stringify({
-        status: "ok",
-        glasses: getGlassesClients().length,
-        vesper: getVesperClients().length,
-        mentra: !!process.env.MENTRA_API_KEY,
-        uptime: process.uptime(),
-      })
-    );
-  } else {
-    res.writeHead(404);
-    res.end();
-  }
-});
+  const httpServer = createServer((req, res) => {
+    if (req.url === "/health") {
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(
+        JSON.stringify({
+          status: "ok",
+          glasses: getGlassesClients().length,
+          vesper: getVesperClients().length,
+          mentra: !!process.env.MENTRA_API_KEY,
+          uptime: process.uptime(),
+        })
+      );
+    } else {
+      res.writeHead(404);
+      res.end();
+    }
+  });
 
-httpServer.listen(HTTP_PORT, () => {
-  console.log(`Health check on port ${HTTP_PORT}`);
-});
+  httpServer.listen(HTTP_PORT, () => {
+    console.log(`Health check on port ${HTTP_PORT}`);
+  });
+}

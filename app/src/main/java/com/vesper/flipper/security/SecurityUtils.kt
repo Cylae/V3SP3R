@@ -89,6 +89,9 @@ class SecurityUtils @Inject constructor() {
      * Check if path contains traversal attempts
      */
     private fun containsTraversal(path: String): Boolean {
+        val isAbsoluteRooted = path.startsWith("/ext/") || path.startsWith("/int/") || path == "/ext" || path == "/int"
+        val minDepth = if (isAbsoluteRooted) 1 else 0
+
         val segments = path.split("/")
         var depth = 0
 
@@ -96,7 +99,7 @@ class SecurityUtils @Inject constructor() {
             when {
                 segment == ".." -> {
                     depth--
-                    if (depth < 0) return true // Trying to escape root
+                    if (depth < minDepth) return true // Trying to escape root
                 }
                 segment.isNotEmpty() && segment != "." -> {
                     depth++
@@ -139,8 +142,8 @@ class SecurityUtils @Inject constructor() {
      */
     fun sanitizeFileName(name: String): String {
         return name
+            .replace("..", "_")                       // Prevent traversal first
             .replace(Regex("[/\\\\:*?\"<>|]"), "_")  // Replace dangerous chars
-            .replace("..", "_")                       // Prevent traversal
             .take(255)                               // Limit length
     }
 
