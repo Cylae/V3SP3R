@@ -1,5 +1,5 @@
 import { WebSocketServer, WebSocket } from "ws";
-import { createServer } from "http";
+import { createServer, Server as HttpServer } from "http";
 
 /**
  * V3SP3R ↔ Mentra Glasses Bridge Server
@@ -20,7 +20,7 @@ import { createServer } from "http";
 
 // ==================== Wire Protocol ====================
 
-interface GlassesMessage {
+export interface GlassesMessage {
   type:
     | "VOICE_TRANSCRIPTION"
     | "CAMERA_PHOTO"
@@ -39,21 +39,21 @@ interface GlassesMessage {
 
 // ==================== Client Tracking ====================
 
-interface ConnectedClient {
+export interface ConnectedClient {
   ws: WebSocket;
   type: "glasses" | "vesper" | "unknown";
   connectedAt: number;
 }
 
-const clients = new Map<WebSocket, ConnectedClient>();
+export const clients = new Map<WebSocket, ConnectedClient>();
 
-function getVesperClients(): WebSocket[] {
+export function getVesperClients(): WebSocket[] {
   return Array.from(clients.entries())
     .filter(([, c]) => c.type === "vesper")
     .map(([ws]) => ws);
 }
 
-function getGlassesClients(): WebSocket[] {
+export function getGlassesClients(): WebSocket[] {
   return Array.from(clients.entries())
     .filter(([, c]) => c.type === "glasses")
     .map(([ws]) => ws);
@@ -68,26 +68,51 @@ export function broadcast(targets: WebSocket[], message: GlassesMessage) {
   }
 }
 
-// ==================== Sailor Mouth Mode ====================
+// ==================== Sailor Mouth & State ====================
 
-let sailorMouthEnabled = false;
-let glassesMuted = false;
+export let sailorMouthEnabled = false;
+export let glassesMuted = false;
+
+export function setSailorMouth(enabled: boolean) {
+  sailorMouthEnabled = enabled;
+}
+
+export function setGlassesMuted(muted: boolean) {
+  glassesMuted = muted;
+}
 
 // ── TTS Echo Suppression ──────────────────────────────────────────
-// When TTS is playing, the glasses mic picks up the audio and
-// re-transcribes it as a user utterance, creating a feedback loop.
-// We suppress transcriptions during TTS playback + a brief cooldown.
-let ttsSpeaking = false;
-let ttsEchoSuppressionUntil = 0;
-const TTS_ECHO_COOLDOWN_MS = 2500; // Extra silence after TTS ends
-let lastSpokenText = ""; // Track what was spoken to detect echoes
+export let ttsSpeaking = false;
+export let ttsEchoSuppressionUntil = 0;
+export const TTS_ECHO_COOLDOWN_MS = 2500;
+export let lastSpokenText = "";
+
+export function setTtsSpeaking(speaking: boolean) {
+  ttsSpeaking = speaking;
+}
+
+export function setLastSpokenText(text: string) {
+  lastSpokenText = text.toLowerCase().replace(/[^a-z0-9\s]/g, " ").replace(/\s+/g, " ").trim();
+}
 
 // Track session context so greetings feel natural
-let wakeCount = 0;
-let lastWakeTimestamp = 0;
-let lastTaskTimestamp = 0; // when we last forwarded a VOICE_COMMAND
+export let wakeCount = 0;
+export let lastWakeTimestamp = 0;
+export let lastTaskTimestamp = 0;
 
-const IDLE_THRESHOLD_MS = 5 * 60 * 1000; // 5 min = "been a while"
+export const IDLE_THRESHOLD_MS = 5 * 60 * 1000;
+
+export function resetSessionContext() {
+  wakeCount = 0;
+  lastWakeTimestamp = 0;
+  lastTaskTimestamp = 0;
+  sailorMouthEnabled = false;
+  glassesMuted = false;
+  ttsSpeaking = false;
+  ttsEchoSuppressionUntil = 0;
+  lastSpokenText = "";
+  clients.clear();
+}
 
 // ── Normal greetings (context-aware) ────────────────────────
 const GREETINGS_FIRST = [
@@ -154,12 +179,11 @@ function pick(arr: string[]): string {
   return arr[Math.floor(Math.random() * arr.length)];
 }
 
-function getWakeGreeting(hasCommand: boolean): string {
+export function getWakeGreeting(hasCommand: boolean): string {
   const now = Date.now();
   const timeSinceLastWake = now - lastWakeTimestamp;
   const isFirstWake = wakeCount === 0;
   const isReturning = timeSinceLastWake > IDLE_THRESHOLD_MS;
-  // "Active" = last task was recent, user is in the middle of a workflow
   const isActive = (now - lastTaskTimestamp) < IDLE_THRESHOLD_MS && !isFirstWake;
 
   wakeCount++;
@@ -174,89 +198,10 @@ function getWakeGreeting(hasCommand: boolean): string {
   if (isReturning) {
     return pick(sailorMouthEnabled ? SAILOR_RETURN : GREETINGS_RETURN);
   }
-  // Mid-session, keep it short
   return pick(sailorMouthEnabled ? SAILOR_ACTIVE : GREETINGS_ACTIVE);
 }
 
-// ==================== WebSocket Relay Server ====================
-
-const PORT = parseInt(process.env.PORT || "8089", 10);
-const wss = new WebSocketServer({ port: PORT });
-
-console.log(`V3SP3R Glasses Bridge running on port ${PORT}`);
-
-// ==================== Heartbeat (keeps connections alive through proxies) ====================
-
-const HEARTBEAT_INTERVAL_MS = 25_000; // 25s — safely under Cloudflare's 100s idle timeout
-
-function heartbeat(this: WebSocket & { isAlive?: boolean }) {
-  this.isAlive = true;
-}
-
-const heartbeatTimer = setInterval(() => {
-  for (const ws of wss.clients) {
-    const sock = ws as WebSocket & { isAlive?: boolean };
-    if (sock.isAlive === false) {
-      console.log("Terminating unresponsive client");
-      clients.delete(ws);
-      return ws.terminate();
-    }
-    sock.isAlive = false;
-    ws.ping();
-  }
-}, HEARTBEAT_INTERVAL_MS);
-
-wss.on("close", () => clearInterval(heartbeatTimer));
-
-wss.on("connection", (ws, req) => {
-  const clientId = req.headers["x-vesper-client"] as string | undefined;
-  const clientType = clientId === "v3sp3r-android" ? "vesper" : "unknown";
-
-  const client: ConnectedClient = {
-    ws,
-    type: clientType as "glasses" | "vesper" | "unknown",
-    connectedAt: Date.now(),
-  };
-  clients.set(ws, client);
-  (ws as WebSocket & { isAlive?: boolean }).isAlive = true;
-  ws.on("pong", heartbeat);
-
-  console.log(
-    `Client connected: ${client.type} (${clients.size} total) from ${req.socket.remoteAddress}`
-  );
-
-  ws.on("message", (data) => {
-    try {
-      const message: GlassesMessage = JSON.parse(data.toString());
-      handleMessage(ws, message);
-    } catch (e) {
-      console.warn("Invalid message:", (e as Error).message);
-    }
-  });
-
-  ws.on("close", () => {
-    clients.delete(ws);
-    console.log(`Client disconnected (${clients.size} remaining)`);
-  });
-
-  ws.on("error", (err) => {
-    console.error("WebSocket error:", err.message);
-    clients.delete(ws);
-  });
-
-  ws.send(
-    JSON.stringify({
-      type: "STATUS_UPDATE",
-      text: "Connected to V3SP3R Glasses Bridge",
-      metadata: {
-        glasses_connected: getGlassesClients().length.toString(),
-        vesper_connected: getVesperClients().length.toString(),
-      },
-    } satisfies GlassesMessage)
-  );
-});
-
-function handleMessage(sender: WebSocket, message: GlassesMessage) {
+export function handleMessage(sender: WebSocket, message: GlassesMessage) {
   const client = clients.get(sender);
   if (!client) return;
 
@@ -273,7 +218,6 @@ function handleMessage(sender: WebSocket, message: GlassesMessage) {
       }
       broadcast(getVesperClients(), message);
 
-      // Relay mode vision trigger: ask glasses to capture a photo
       if (message.text) {
         const lower = message.text.toLowerCase();
         const visionTriggers = [
@@ -314,8 +258,6 @@ function handleMessage(sender: WebSocket, message: GlassesMessage) {
       break;
 
     case "CAPTURE_REQUEST":
-      // V3SP3R Android app requesting a photo capture (agent request_photo action).
-      // Forward to glasses clients so MentraOS virtual client triggers captureAndAnalyze.
       if (client.type === "unknown") {
         client.type = "vesper";
         console.log("Client identified as vesper (via CAPTURE_REQUEST)");
@@ -339,409 +281,15 @@ function handleMessage(sender: WebSocket, message: GlassesMessage) {
   }
 }
 
-// ==================== MentraOS Native Integration ====================
-// Activated when MENTRA_API_KEY is set.
-// Uses @mentra/sdk v2.1.29 — verified API surface.
-
-/**
- * Wait for the MentraOS session's internal WebSocket to be ready.
- * The SDK fires onSession before the glasses WebSocket handshake completes,
- * so calling session.layouts.showTextWall (→ AppSession.send) immediately
- * throws "WebSocket connection not established".
- *
- * We poll a lightweight send to detect readiness (max ~5 seconds).
- */
-async function waitForSessionReady(
-  session: any,
-  sessionId: string,
-  maxWaitMs = 5000,
-  intervalMs = 250
-): Promise<void> {
-  const deadline = Date.now() + maxWaitMs;
-  while (Date.now() < deadline) {
-    try {
-      // Probe with a short-lived text wall — if send() doesn't throw, we're ready
-      await session.layouts.showTextWall("", { durationMs: 1 });
-      return;
-    } catch {
-      // WebSocket not ready yet — wait and retry
-      await new Promise((r) => setTimeout(r, intervalMs));
-    }
-  }
-  console.warn(
-    `[MentraOS] Session ${sessionId} WebSocket not ready after ${maxWaitMs}ms — proceeding anyway`
-  );
-}
-
-async function startMentraIntegration() {
-  const apiKey = process.env.MENTRA_API_KEY;
-  if (!apiKey) {
-    console.log(
-      "MentraOS: No MENTRA_API_KEY set — running in standalone relay mode."
-    );
-    console.log(
-      "  Set MENTRA_API_KEY to enable native Mentra glasses integration."
-    );
-    return;
-  }
-
-  try {
-    // Dynamic import so the bridge works without @mentra/sdk installed
-    const { AppServer } = await import("@mentra/sdk");
-
-    const packageName =
-      process.env.MENTRA_PACKAGE_NAME || "com.vesper.glasses";
-    const mentraPort = parseInt(process.env.MENTRA_PORT || "3000", 10);
-
-    class VesperGlassesBridge extends AppServer {
-      protected async onSession(
-        session: any,
-        sessionId: string,
-        userId: string
-      ) {
-        console.log(
-          `[MentraOS] Session started: ${sessionId} (user: ${userId})`
-        );
-
-        // Wait for the SDK's internal WebSocket to the glasses to be ready.
-        // AppSession.send() throws synchronously if called before the
-        // connection is established, which would kill onSession entirely.
-        await waitForSessionReady(session, sessionId);
-
-        // Show welcome on glasses HUD (non-fatal — don't let this kill setup)
-        try {
-          await session.layouts.showTextWall("V3SP3R Connected", {
-            durationMs: 3000,
-          });
-        } catch (e) {
-          console.warn(
-            `[MentraOS] Welcome display failed (non-fatal): ${(e as Error).message}`
-          );
-        }
-
-        // ── Wake word state ─────────────────────────────────────
-        // "Hey Vesper" activates the agent. Two modes:
-        //   1. "Hey Vesper, <command>" — immediate execution
-        //   2. "Hey Vesper" alone — arms for the next utterance
-        let awaitingCommand = false;
-        let awaitingTimer: ReturnType<typeof setTimeout> | null = null;
-        const WAKE_TIMEOUT_MS = 15_000; // 15s to say follow-up command
-
-        function resetAwaitingState() {
-          awaitingCommand = false;
-          if (awaitingTimer) {
-            clearTimeout(awaitingTimer);
-            awaitingTimer = null;
-          }
-        }
-
-        // ── Voice → V3SP3R ────────────────────────────────────────
-        session.events.onTranscription(
-          async (data: {
-            text: string;
-            isFinal: boolean;
-            transcribeLanguage?: string;
-          }) => {
-            if (!data.isFinal || !data.text.trim()) return;
-            if (glassesMuted) return; // Muted — suppress all voice input
-
-            // ── TTS Echo Suppression ────────────────────────────
-            // Suppress transcriptions while TTS is playing or in cooldown
-            if (ttsSpeaking || Date.now() < ttsEchoSuppressionUntil) {
-              console.log(`[Echo] Suppressed during TTS: "${data.text.trim().slice(0, 40)}"`);
-              return;
-            }
-            // Also catch echoes that slip past the timing window
-            if (isLikelyTtsEcho(data.text.trim())) {
-              console.log(`[Echo] Suppressed echo match: "${data.text.trim().slice(0, 40)}"`);
-              return;
-            }
-
-            const rawText = data.text.trim();
-            const lowerText = rawText.toLowerCase();
-
-            // ── Wake word detection ──────────────────────────────
-            const wakePatterns = [
-              /^hey\s+vesper[\s,.:!]*(.*)$/i,
-              /^vesper[\s,.:!]*(.*)$/i,
-            ];
-
-            let command: string | null = null;
-            let isWakeTriggered = false;
-
-            for (const pattern of wakePatterns) {
-              const match = rawText.match(pattern);
-              if (match) {
-                isWakeTriggered = true;
-                command = match[1]?.trim() || null;
-                break;
-              }
-            }
-
-            if (isWakeTriggered) {
-              const hasCommand = !!(command && command.length > 0);
-
-              // Greet on wake — cancel any in-flight speech first
-              try { await session.audio.stop(); } catch { /* no-op */ }
-              speakWithEchoGuard(session, getWakeGreeting(hasCommand)).catch(() => {});
-
-              if (hasCommand) {
-                // "Hey Vesper, scan this" — immediate command
-                console.log(`[MentraOS] Wake + command: "${command}"`);
-                lastTaskTimestamp = Date.now();
-                resetAwaitingState();
-
-                broadcast(getVesperClients(), {
-                  type: "VOICE_COMMAND",
-                  text: command!,
-                  metadata: {
-                    source: "mentra",
-                    sessionId,
-                    language: data.transcribeLanguage || "en",
-                    wake_word: "true",
-                  },
-                });
-
-                // Check for vision triggers
-                checkVisionTrigger(session, command!);
-              } else {
-                // "Hey Vesper" alone — arm for next utterance
-                console.log(`[MentraOS] Wake word detected — awaiting command`);
-                resetAwaitingState();
-                awaitingCommand = true;
-                awaitingTimer = setTimeout(() => {
-                  console.log(`[MentraOS] Wake word timed out`);
-                  awaitingCommand = false;
-                  awaitingTimer = null;
-                  try {
-                    session.layouts
-                      .showTextWall("Vesper: timed out", { durationMs: 2000 })
-                      .catch(() => {});
-                  } catch {
-                    // Session WebSocket may have disconnected
-                  }
-                }, WAKE_TIMEOUT_MS);
-
-                try {
-                  session.layouts
-                    .showTextWall("Vesper: listening...", { durationMs: 3000 })
-                    .catch(() => {});
-                } catch {
-                  // Session WebSocket may have disconnected
-                }
-
-                broadcast(getVesperClients(), {
-                  type: "STATUS_UPDATE",
-                  text: "Vesper listening...",
-                  metadata: { source: "mentra", wake_word: "true" },
-                });
-              }
-              return;
-            }
-
-            // ── Armed follow-up: treat this as the command ───────
-            if (awaitingCommand) {
-              console.log(`[MentraOS] Follow-up command: "${rawText}"`);
-              lastTaskTimestamp = Date.now();
-              resetAwaitingState();
-
-              broadcast(getVesperClients(), {
-                type: "VOICE_COMMAND",
-                text: rawText,
-                metadata: {
-                  source: "mentra",
-                  sessionId,
-                  language: data.transcribeLanguage || "en",
-                  wake_word: "true",
-                },
-              });
-
-              checkVisionTrigger(session, rawText);
-              return;
-            }
-
-            // ── No wake word, not armed — relay as passive transcription ──
-            // (only sent if auto-send is on in the Android app)
-            console.log(`[MentraOS] Voice (passive): "${rawText}"`);
-            broadcast(getVesperClients(), {
-              type: "VOICE_TRANSCRIPTION",
-              text: rawText,
-              isFinal: true,
-              metadata: {
-                source: "mentra",
-                sessionId,
-                language: data.transcribeLanguage || "en",
-              },
-            });
-          }
-        );
-
-        // ── Camera events → V3SP3R ───────────────────────────────
-        // Helper: broadcast a captured photo to V3SP3R
-        function broadcastPhoto(rawData: any, prompt: string, mimeType?: string) {
-          const imageBase64 = Buffer.from(rawData).toString("base64");
-          console.log(`[MentraOS] Photo captured: ${imageBase64.length} chars base64`);
-          broadcast(getVesperClients(), {
-            type: "CAMERA_PHOTO",
-            text: prompt,
-            imageBase64,
-            imageMimeType: mimeType || "image/jpeg",
-            metadata: { source: "mentra", sessionId },
-          });
-        }
-
-        function extractPhotoData(data: Record<string, any>): any {
-          return data.photoData ?? data.data ?? data.buffer ?? data.image ?? data.photo ?? data.base64;
-        }
-
-        try {
-          // Register for photo events — try multiple known event names
-          const photoEventNames = ["onPhotoTaken", "onCameraCapture", "onImageCapture", "onPhoto", "onSnapshot"];
-          let photoEventRegistered = false;
-
-          if (session.events) {
-            for (const evtName of photoEventNames) {
-              if (typeof session.events[evtName] === "function") {
-                session.events[evtName]((data: Record<string, any>) => {
-                  console.log(`[MentraOS] ${evtName} fired! Keys:`, Object.keys(data).join(", "));
-                  const rawData = extractPhotoData(data);
-                  if (!rawData) {
-                    console.error(`[MentraOS] ${evtName}: no data field. Keys:`, Object.keys(data).join(", "));
-                    for (const [k, v] of Object.entries(data)) {
-                      const preview = typeof v === "string" ? v.slice(0, 80) : `[${typeof v}]`;
-                      console.error(`  data.${k} = ${preview}`);
-                    }
-                    return;
-                  }
-                  broadcastPhoto(rawData, "What am I looking at?");
-                });
-                console.log(`[MentraOS] Photo listener registered via session.events.${evtName}`);
-                photoEventRegistered = true;
-                break;
-              }
-            }
-            if (!photoEventRegistered) {
-              console.warn(`[MentraOS] No photo event handler found on session.events`);
-              console.warn(`  Available events: ${Object.keys(session.events).join(", ")}`);
-            }
-          }
-
-          // Also register camera.onCapture if available
-          if (session.camera) {
-            const cameraCallbacks = ["onCapture", "onPhoto", "onPhotoTaken"];
-            for (const cbName of cameraCallbacks) {
-              if (typeof session.camera[cbName] === "function") {
-                console.log(`[MentraOS] Registering session.camera.${cbName} listener`);
-                session.camera[cbName]((photo: Record<string, any>) => {
-                  console.log(`[MentraOS] camera.${cbName} fired! Keys:`, Object.keys(photo).join(", "));
-                  const rawData = extractPhotoData(photo);
-                  if (!rawData) return;
-                  broadcastPhoto(rawData, "What am I looking at?", photo.mimeType);
-                });
-                break;
-              }
-            }
-          }
-
-          // ── Button press → camera capture fallback ────────────────
-          // Some glasses fire onButtonPress for the camera button instead of
-          // onPhotoTaken. When we detect a camera-related button press,
-          // programmatically request a photo capture.
-          if (session.events && typeof session.events.onButtonPress === "function") {
-            session.events.onButtonPress(async (data: Record<string, any>) => {
-              const buttonName = (data.button ?? data.name ?? data.type ?? "").toString().toLowerCase();
-              console.log(`[MentraOS] Button press: ${JSON.stringify(data)}`);
-
-              const cameraButtons = ["camera", "capture", "photo", "snap", "shutter"];
-              if (cameraButtons.some(b => buttonName.includes(b))) {
-                console.log("[MentraOS] Camera button detected — requesting photo capture");
-                captureAndAnalyze(session, "What am I looking at?");
-              }
-            });
-            console.log("[MentraOS] Button press listener registered (camera fallback)");
-          }
-        } catch (e) {
-          console.warn(`[MentraOS] Failed to register photo listener: ${(e as Error).message}`);
-        }
-
-        // ── Session keepalive ────────────────────────────────────────
-        // Periodically poke the session so MentraOS doesn't idle-kill the
-        // mini app. Also serves as a health-check log line.
-        const keepaliveTimer = setInterval(async () => {
-          try {
-            if (session.isConnected?.() ?? true) {
-              await session.layouts.showTextWall("V3SP3R Active", {
-                durationMs: 1000,
-              });
-            }
-          } catch {
-            // Session may have ended — cleanup will handle it
-          }
-        }, 30_000);
-
-        // Register a virtual "glasses" client for this MentraOS session
-        // so relay broadcasts reach it.
-        const virtualWs = {
-          readyState: WebSocket.OPEN,
-          send: (payload: string) => {
-            try {
-              const message: GlassesMessage = JSON.parse(payload);
-              handleMentraResponse(session, message);
-            } catch {
-              // ignore
-            }
-          },
-        } as unknown as WebSocket;
-
-        clients.set(virtualWs, {
-          ws: virtualWs,
-          type: "glasses",
-          connectedAt: Date.now(),
-        });
-
-        // Cleanup on session end
-        session.addCleanupHandler?.(() => {
-          clearInterval(keepaliveTimer);
-          clients.delete(virtualWs);
-          console.log(`[MentraOS] Session ended: ${sessionId}`);
-        });
-      }
-    }
-
-    const app = new VesperGlassesBridge({
-      packageName,
-      apiKey,
-      port: mentraPort,
-    });
-
-    await app.start();
-    console.log(
-      `[MentraOS] Native integration active on port ${mentraPort}`
-    );
-    console.log(`[MentraOS] Package: ${packageName}`);
-  } catch (e) {
-    console.warn(
-      "[MentraOS] SDK not available — running in standalone relay mode."
-    );
-    console.warn(`  Install with: npm install @mentra/sdk`);
-    console.warn(`  Error: ${(e as Error).message}`);
-  }
-}
-
-/** Check if text contains a vision trigger and capture if so. */
-function checkVisionTrigger(session: any, text: string) {
+export function checkVisionTrigger(session: any, text: string) {
   const visionTriggers = [
-    // Explicit photo requests
     "take a photo", "take a picture", "capture this", "screenshot",
     "snap a pic", "take a snap", "get a photo", "photograph",
-    // "Look at" / identification requests
     "what am i looking at", "what do you see", "what is this",
     "analyze this", "scan this", "identify this", "read this",
     "what's this", "what is that", "what's that",
-    // Contextual "this/that" + action verbs for devices
     "turn on this", "turn off this", "turn on that", "turn off that",
     "control this", "control that",
-    // Implicit vision (user points at something)
     "this tv", "that tv", "this ac", "that ac", "this device", "that device",
     "the one i'm looking at", "right in front of me", "i'm looking at",
   ];
@@ -751,47 +299,20 @@ function checkVisionTrigger(session: any, text: string) {
   }
 }
 
-/** Capture a photo from glasses camera and send for vision analysis. */
-async function captureAndAnalyze(session: any, prompt: string) {
+export async function captureAndAnalyze(session: any, prompt: string) {
   try {
     try {
       await session.layouts.showTextWall("Capturing...", { durationMs: 2000 });
-    } catch { /* WebSocket may not be ready */ }
+    } catch { /* ignore */ }
 
-    // Check if camera API is available
     if (!session.camera) {
       console.error("[MentraOS] session.camera is missing entirely");
-      console.error("  session keys:", Object.keys(session).join(", "));
       try {
         await session.layouts.showTextWall("Camera not available", { durationMs: 3000 });
       } catch { /* ignore */ }
       return;
     }
 
-    // Log available camera methods — check both own and prototype properties
-    const cameraOwnKeys = Object.keys(session.camera).filter(
-      (k) => typeof session.camera[k] === "function"
-    );
-    // Also check prototype chain for methods (SDK may use class-based API)
-    const cameraProtoKeys: string[] = [];
-    try {
-      const proto = Object.getPrototypeOf(session.camera);
-      if (proto && proto !== Object.prototype) {
-        for (const k of Object.getOwnPropertyNames(proto)) {
-          if (k !== "constructor" && typeof session.camera[k] === "function") {
-            cameraProtoKeys.push(k);
-          }
-        }
-      }
-    } catch { /* ignore */ }
-    const allCameraMethods = [...new Set([...cameraOwnKeys, ...cameraProtoKeys])];
-    console.log("[MentraOS] Camera API methods (own):", cameraOwnKeys.join(", ") || "(none)");
-    if (cameraProtoKeys.length > 0) {
-      console.log("[MentraOS] Camera API methods (prototype):", cameraProtoKeys.join(", "));
-    }
-    console.log("[MentraOS] Camera object keys:", Object.keys(session.camera).join(", ") || "(none)");
-
-    // Try multiple known method names
     const captureMethod = session.camera.requestPhoto
       ?? session.camera.capture
       ?? session.camera.takePhoto
@@ -799,14 +320,12 @@ async function captureAndAnalyze(session: any, prompt: string) {
 
     if (typeof captureMethod !== "function") {
       console.error("[MentraOS] No known capture method found on session.camera");
-      console.error("  Available:", Object.keys(session.camera).join(", "));
       try {
         await session.layouts.showTextWall("Camera API unsupported", { durationMs: 3000 });
       } catch { /* ignore */ }
       return;
     }
 
-    console.log("[MentraOS] Requesting photo from glasses camera...");
     const photo = await captureMethod.call(session.camera, {
       metadata: { reason: "vesper-vision" },
     });
@@ -816,14 +335,10 @@ async function captureAndAnalyze(session: any, prompt: string) {
       return;
     }
 
-    // Mentra SDK returns photo data under varying field names depending on version.
-    // Try all known fields: photoData (docs), data, buffer, image, photo
     let rawData = photo.photoData ?? photo.data ?? photo.buffer ?? photo.image ?? photo.photo;
 
-    // Handle URL-based photo responses — fetch and convert to buffer
     if (!rawData && (photo.url || photo.photoUrl)) {
       const photoUrl = photo.url || photo.photoUrl;
-      console.log("[MentraOS] Photo is URL-based, fetching:", photoUrl);
       try {
         const resp = await fetch(photoUrl);
         if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
@@ -835,17 +350,11 @@ async function captureAndAnalyze(session: any, prompt: string) {
     }
 
     if (!rawData) {
-      console.error("[MentraOS] Photo object has no recognizable data field. Keys:", Object.keys(photo).join(", "));
-      // Log all values for debugging — truncate large values
-      for (const [k, v] of Object.entries(photo)) {
-        const preview = typeof v === "string" ? v.slice(0, 80) : typeof v;
-        console.error(`  photo.${k} = ${preview}`);
-      }
+      console.error("[MentraOS] Photo object has no recognizable data field.");
       return;
     }
 
     const imageBase64 = Buffer.from(rawData).toString("base64");
-    console.log(`[MentraOS] Photo received: ${imageBase64.length} chars, mime: ${photo.mimeType || "image/jpeg"}`);
 
     broadcast(getVesperClients(), {
       type: "CAMERA_PHOTO",
@@ -857,7 +366,7 @@ async function captureAndAnalyze(session: any, prompt: string) {
 
     try {
       await session.layouts.showTextWall("Analyzing...", { durationMs: 3000 });
-    } catch { /* WebSocket may not be ready */ }
+    } catch { /* ignore */ }
   } catch (e) {
     const errMsg = (e as Error).message;
     console.error("[MentraOS] Vision capture failed:", errMsg);
@@ -867,14 +376,9 @@ async function captureAndAnalyze(session: any, prompt: string) {
   }
 }
 
-/**
- * Speak text through glasses TTS with echo suppression.
- * Sets flags so the transcription handler knows to ignore mic input
- * that is just the glasses speaker being picked up.
- */
-async function speakWithEchoGuard(session: any, text: string) {
+export async function speakWithEchoGuard(session: any, text: string) {
   ttsSpeaking = true;
-  lastSpokenText = text.toLowerCase().replace(/[^a-z0-9\s]/g, "").trim();
+  lastSpokenText = text.toLowerCase().replace(/[^a-z0-9\s]/g, " ").replace(/\s+/g, " ").trim();
   try {
     await session.audio.speak(text, {
       language: "en-GB",
@@ -886,19 +390,13 @@ async function speakWithEchoGuard(session: any, text: string) {
   }
 }
 
-/**
- * Check if a transcription looks like an echo of recent TTS output.
- * Compares normalized text similarity.
- */
-function isLikelyTtsEcho(transcription: string): boolean {
+export function isLikelyTtsEcho(transcription: string): boolean {
   if (!lastSpokenText) return false;
-  const normalized = transcription.toLowerCase().replace(/[^a-z0-9\s]/g, "").trim();
+  const normalized = transcription.toLowerCase().replace(/[^a-z0-9\s]/g, " ").replace(/\s+/g, " ").trim();
   if (!normalized) return false;
-  // Check if the transcription is a substring of what was spoken or vice versa
   if (lastSpokenText.includes(normalized) || normalized.includes(lastSpokenText)) {
     return true;
   }
-  // Check word overlap — if >60% of words match, it's an echo
   const spokenWords = new Set(lastSpokenText.split(/\s+/));
   const transWords = normalized.split(/\s+/);
   if (transWords.length === 0) return false;
@@ -906,8 +404,7 @@ function isLikelyTtsEcho(transcription: string): boolean {
   return overlap / transWords.length > 0.6;
 }
 
-/** Handle V3SP3R AI responses — speak + display on MentraOS glasses. */
-async function handleMentraResponse(session: any, message: GlassesMessage) {
+export async function handleMentraResponse(session: any, message: GlassesMessage) {
   try {
     switch (message.type) {
       case "AI_RESPONSE":
@@ -936,7 +433,6 @@ async function handleMentraResponse(session: any, message: GlassesMessage) {
         break;
 
       case "CAPTURE_REQUEST":
-        // Agent requested a photo capture via request_photo tool action
         console.log("[MentraOS] Received CAPTURE_REQUEST from V3SP3R agent");
         captureAndAnalyze(session, message.text || "What am I looking at?");
         break;
@@ -946,31 +442,272 @@ async function handleMentraResponse(session: any, message: GlassesMessage) {
   }
 }
 
-// Start MentraOS integration (non-blocking — falls back to relay-only mode)
-startMentraIntegration();
-
-// ==================== Health Check ====================
-
-const HTTP_PORT = parseInt(process.env.HTTP_PORT || "8088", 10);
-
-const httpServer = createServer((req, res) => {
-  if (req.url === "/health") {
-    res.writeHead(200, { "Content-Type": "application/json" });
-    res.end(
-      JSON.stringify({
-        status: "ok",
-        glasses: getGlassesClients().length,
-        vesper: getVesperClients().length,
-        mentra: !!process.env.MENTRA_API_KEY,
-        uptime: process.uptime(),
-      })
-    );
-  } else {
-    res.writeHead(404);
-    res.end();
+async function waitForSessionReady(
+  session: any,
+  sessionId: string,
+  maxWaitMs = 5000,
+  intervalMs = 250
+): Promise<void> {
+  const deadline = Date.now() + maxWaitMs;
+  while (Date.now() < deadline) {
+    try {
+      await session.layouts.showTextWall("", { durationMs: 1 });
+      return;
+    } catch {
+      await new Promise((r) => setTimeout(r, intervalMs));
+    }
   }
-});
+}
 
-httpServer.listen(HTTP_PORT, () => {
-  console.log(`Health check on port ${HTTP_PORT}`);
-});
+export async function startMentraIntegration() {
+  const apiKey = process.env.MENTRA_API_KEY;
+  if (!apiKey) {
+    console.log("MentraOS: No MENTRA_API_KEY set — running in standalone relay mode.");
+    return;
+  }
+
+  try {
+    const { AppServer } = await import("@mentra/sdk");
+    const packageName = process.env.MENTRA_PACKAGE_NAME || "com.vesper.glasses";
+    const mentraPort = parseInt(process.env.MENTRA_PORT || "3000", 10);
+
+    class VesperGlassesBridge extends AppServer {
+      protected async onSession(session: any, sessionId: string, userId: string) {
+        await waitForSessionReady(session, sessionId);
+        try {
+          await session.layouts.showTextWall("V3SP3R Connected", { durationMs: 3000 });
+        } catch { /* ignore */ }
+
+        let awaitingCommand = false;
+        let awaitingTimer: ReturnType<typeof setTimeout> | null = null;
+        const WAKE_TIMEOUT_MS = 15_000;
+
+        function resetAwaitingState() {
+          awaitingCommand = false;
+          if (awaitingTimer) {
+            clearTimeout(awaitingTimer);
+            awaitingTimer = null;
+          }
+        }
+
+        session.events.onTranscription(
+          async (data: { text: string; isFinal: boolean; transcribeLanguage?: string }) => {
+            if (!data.isFinal || !data.text.trim()) return;
+            if (glassesMuted) return;
+
+            if (ttsSpeaking || Date.now() < ttsEchoSuppressionUntil) return;
+            if (isLikelyTtsEcho(data.text.trim())) return;
+
+            const rawText = data.text.trim();
+
+            const wakePatterns = [
+              /^hey\s+vesper[\s,.:!]*(.*)$/i,
+              /^vesper[\s,.:!]*(.*)$/i,
+            ];
+
+            let command: string | null = null;
+            let isWakeTriggered = false;
+
+            for (const pattern of wakePatterns) {
+              const match = rawText.match(pattern);
+              if (match) {
+                isWakeTriggered = true;
+                command = match[1]?.trim() || null;
+                break;
+              }
+            }
+
+            if (isWakeTriggered) {
+              const hasCommand = !!(command && command.length > 0);
+              try { await session.audio.stop(); } catch { /* no-op */ }
+              speakWithEchoGuard(session, getWakeGreeting(hasCommand)).catch(() => {});
+
+              if (hasCommand) {
+                lastTaskTimestamp = Date.now();
+                resetAwaitingState();
+
+                broadcast(getVesperClients(), {
+                  type: "VOICE_COMMAND",
+                  text: command!,
+                  metadata: {
+                    source: "mentra",
+                    sessionId,
+                    language: data.transcribeLanguage || "en",
+                    wake_word: "true",
+                  },
+                });
+
+                checkVisionTrigger(session, command!);
+              } else {
+                resetAwaitingState();
+                awaitingCommand = true;
+                awaitingTimer = setTimeout(() => {
+                  awaitingCommand = false;
+                  awaitingTimer = null;
+                }, WAKE_TIMEOUT_MS);
+
+                broadcast(getVesperClients(), {
+                  type: "STATUS_UPDATE",
+                  text: "Vesper listening...",
+                  metadata: { source: "mentra", wake_word: "true" },
+                });
+              }
+              return;
+            }
+
+            if (awaitingCommand) {
+              lastTaskTimestamp = Date.now();
+              resetAwaitingState();
+
+              broadcast(getVesperClients(), {
+                type: "VOICE_COMMAND",
+                text: rawText,
+                metadata: {
+                  source: "mentra",
+                  sessionId,
+                  language: data.transcribeLanguage || "en",
+                  wake_word: "true",
+                },
+              });
+
+              checkVisionTrigger(session, rawText);
+              return;
+            }
+
+            broadcast(getVesperClients(), {
+              type: "VOICE_TRANSCRIPTION",
+              text: rawText,
+              isFinal: true,
+              metadata: {
+                source: "mentra",
+                sessionId,
+                language: data.transcribeLanguage || "en",
+              },
+            });
+          }
+        );
+
+        const virtualWs = {
+          readyState: WebSocket.OPEN,
+          send: (payload: string) => {
+            try {
+              const message: GlassesMessage = JSON.parse(payload);
+              handleMentraResponse(session, message);
+            } catch { /* ignore */ }
+          },
+        } as unknown as WebSocket;
+
+        clients.set(virtualWs, {
+          ws: virtualWs,
+          type: "glasses",
+          connectedAt: Date.now(),
+        });
+
+        session.addCleanupHandler?.(() => {
+          clients.delete(virtualWs);
+        });
+      }
+    }
+
+    const app = new VesperGlassesBridge({ packageName, apiKey, port: mentraPort });
+    await app.start();
+  } catch (e) {
+    console.warn("[MentraOS] SDK not available — running in standalone relay mode.");
+  }
+}
+
+// Server Lifecycle Management
+export let wss: WebSocketServer | null = null;
+export let httpServer: HttpServer | null = null;
+
+export function startServers() {
+  const PORT = parseInt(process.env.PORT || "8089", 10);
+  wss = new WebSocketServer({ port: PORT });
+  console.log(`V3SP3R Glasses Bridge running on port ${PORT}`);
+
+  const HEARTBEAT_INTERVAL_MS = 25_000;
+
+  const heartbeatTimer = setInterval(() => {
+    if (!wss) return;
+    for (const ws of wss.clients) {
+      const sock = ws as WebSocket & { isAlive?: boolean };
+      if (sock.isAlive === false) {
+        clients.delete(ws);
+        return ws.terminate();
+      }
+      sock.isAlive = false;
+      ws.ping();
+    }
+  }, HEARTBEAT_INTERVAL_MS);
+
+  wss.on("close", () => clearInterval(heartbeatTimer));
+
+  wss.on("connection", (ws, req) => {
+    const clientId = req.headers["x-vesper-client"] as string | undefined;
+    const clientType = clientId === "v3sp3r-android" ? "vesper" : "unknown";
+
+    const client: ConnectedClient = {
+      ws,
+      type: clientType as "glasses" | "vesper" | "unknown",
+      connectedAt: Date.now(),
+    };
+    clients.set(ws, client);
+    (ws as WebSocket & { isAlive?: boolean }).isAlive = true;
+
+    ws.on("message", (data) => {
+      try {
+        const message: GlassesMessage = JSON.parse(data.toString());
+        handleMessage(ws, message);
+      } catch (e) {
+        console.warn("Invalid message:", (e as Error).message);
+      }
+    });
+
+    ws.on("close", () => {
+      clients.delete(ws);
+    });
+
+    ws.on("error", () => {
+      clients.delete(ws);
+    });
+
+    ws.send(
+      JSON.stringify({
+        type: "STATUS_UPDATE",
+        text: "Connected to V3SP3R Glasses Bridge",
+        metadata: {
+          glasses_connected: getGlassesClients().length.toString(),
+          vesper_connected: getVesperClients().length.toString(),
+        },
+      } satisfies GlassesMessage)
+    );
+  });
+
+  const HTTP_PORT = parseInt(process.env.HTTP_PORT || "8088", 10);
+  httpServer = createServer((req, res) => {
+    if (req.url === "/health") {
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(
+        JSON.stringify({
+          status: "ok",
+          glasses: getGlassesClients().length,
+          vesper: getVesperClients().length,
+          mentra: !!process.env.MENTRA_API_KEY,
+          uptime: process.uptime(),
+        })
+      );
+    } else {
+      res.writeHead(404);
+      res.end();
+    }
+  });
+
+  httpServer.listen(HTTP_PORT);
+
+  startMentraIntegration();
+}
+
+// Only start servers automatically if NOT running in test environment
+if (process.env.NODE_ENV !== "test") {
+  startServers();
+}
