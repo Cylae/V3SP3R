@@ -38,8 +38,10 @@ abstract class GlassesAdapter {
 
     this.ws.on("message", (data) => {
       try {
-        const message: GlassesMessage = JSON.parse(data.toString());
-        this.onBridgeMessage(message);
+        const message = JSON.parse(data.toString());
+        if (message && typeof message === "object" && typeof message.type === "string") {
+          this.onBridgeMessage(message as GlassesMessage);
+        }
       } catch {
         console.warn(`[${this.name}] Invalid bridge message`);
       }
@@ -111,43 +113,45 @@ export class MentraAdapter extends GlassesAdapter {
   initSession(session: any) {
     this.session = session;
 
-    // Voice transcription → V3SP3R
-    session.events.onTranscription(
-      (data: { text: string; isFinal: boolean; transcribeLanguage?: string }) => {
-        if (data.isFinal && data.text.trim()) {
-          console.log(`[MentraOS] Transcription: "${data.text}"`);
+    if (session?.events) {
+      // Voice transcription → V3SP3R
+      session.events.onTranscription?.(
+        (data: { text: string; isFinal: boolean; transcribeLanguage?: string }) => {
+          if (data.isFinal && data.text.trim()) {
+            console.log(`[MentraOS] Transcription: "${data.text}"`);
+            this.send({
+              type: "VOICE_TRANSCRIPTION",
+              text: data.text.trim(),
+              isFinal: true,
+              metadata: {
+                source: "mentra",
+                language: data.transcribeLanguage || "en",
+              },
+            });
+          }
+        }
+      );
+
+      // Reactive photo events (when user takes photo via glasses UI)
+      session.events.onPhotoTaken?.(
+        (data: { photoData: ArrayBuffer }) => {
+          const imageBase64 = Buffer.from(data.photoData).toString("base64");
+          console.log(`[MentraOS] Photo taken: ${imageBase64.length} chars`);
           this.send({
-            type: "VOICE_TRANSCRIPTION",
-            text: data.text.trim(),
-            isFinal: true,
-            metadata: {
-              source: "mentra",
-              language: data.transcribeLanguage || "en",
-            },
+            type: "CAMERA_PHOTO",
+            text: "What am I looking at?",
+            imageBase64,
+            imageMimeType: "image/jpeg",
+            metadata: { source: "mentra" },
           });
         }
-      }
-    );
+      );
 
-    // Reactive photo events (when user takes photo via glasses UI)
-    session.events.onPhotoTaken(
-      (data: { photoData: ArrayBuffer }) => {
-        const imageBase64 = Buffer.from(data.photoData).toString("base64");
-        console.log(`[MentraOS] Photo taken: ${imageBase64.length} chars`);
-        this.send({
-          type: "CAMERA_PHOTO",
-          text: "What am I looking at?",
-          imageBase64,
-          imageMimeType: "image/jpeg",
-          metadata: { source: "mentra" },
-        });
-      }
-    );
-
-    // Button press → could trigger voice command mode or photo capture
-    session.events.onButtonPress((data: any) => {
-      console.log(`[MentraOS] Button press:`, data);
-    });
+      // Button press → could trigger voice command mode or photo capture
+      session.events.onButtonPress?.((data: any) => {
+        console.log(`[MentraOS] Button press:`, data);
+      });
+    }
 
     console.log("[MentraOS] Session initialized — listening for voice & camera events");
   }
@@ -253,8 +257,10 @@ export class GenericGlassesAdapter extends GlassesAdapter {
 
     this.glassesWs.on("message", (data) => {
       try {
-        const message: GlassesMessage = JSON.parse(data.toString());
-        this.send(message);
+        const message = JSON.parse(data.toString());
+        if (message && typeof message === "object" && typeof message.type === "string") {
+          this.send(message as GlassesMessage);
+        }
       } catch {
         // ignore invalid messages
       }
