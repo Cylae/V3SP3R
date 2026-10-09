@@ -139,8 +139,8 @@ class SecurityUtils @Inject constructor() {
      */
     fun sanitizeFileName(name: String): String {
         return name
-            .replace(Regex("[/\\\\:*?\"<>|]"), "_")  // Replace dangerous chars
             .replace("..", "_")                       // Prevent traversal
+            .replace(Regex("[/\\\\:*?\"<>|]"), "_")  // Replace dangerous chars
             .take(255)                               // Limit length
     }
 
@@ -274,9 +274,9 @@ object InputValidator {
      */
     fun sanitizeForDisplay(input: String): String {
         return input
+            .replace("&", "&amp;")
             .replace("<", "&lt;")
             .replace(">", "&gt;")
-            .replace("&", "&amp;")
             .take(10000)
     }
 
