@@ -20,7 +20,7 @@ interface GlassesMessage {
 
 // ==================== Base Adapter ====================
 
-abstract class GlassesAdapter {
+export abstract class GlassesAdapter {
   protected ws: WebSocket | null = null;
   protected bridgeUrl: string;
 

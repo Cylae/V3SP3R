@@ -181,80 +181,88 @@ function getWakeGreeting(hasCommand: boolean): string {
 // ==================== WebSocket Relay Server ====================
 
 const PORT = parseInt(process.env.PORT || "8089", 10);
-const wss = new WebSocketServer({ port: PORT });
+const isTestEnv = process.env.NODE_ENV === "test";
 
-console.log(`V3SP3R Glasses Bridge running on port ${PORT}`);
+let wss: WebSocketServer | null = null;
+let heartbeatTimer: NodeJS.Timeout | null = null;
 
-// ==================== Heartbeat (keeps connections alive through proxies) ====================
+if (!isTestEnv) {
+  wss = new WebSocketServer({ port: PORT });
+  console.log(`V3SP3R Glasses Bridge running on port ${PORT}`);
 
-const HEARTBEAT_INTERVAL_MS = 25_000; // 25s — safely under Cloudflare's 100s idle timeout
+  const HEARTBEAT_INTERVAL_MS = 25_000;
+  heartbeatTimer = setInterval(() => {
+    if (!wss) return;
+    for (const ws of wss.clients) {
+      const sock = ws as WebSocket & { isAlive?: boolean };
+      if (sock.isAlive === false) {
+        console.log("Terminating unresponsive client");
+        clients.delete(ws);
+        return ws.terminate();
+      }
+      sock.isAlive = false;
+      ws.ping();
+    }
+  }, HEARTBEAT_INTERVAL_MS);
+
+  wss.on("close", () => {
+    if (heartbeatTimer) clearInterval(heartbeatTimer);
+  });
+}
 
 function heartbeat(this: WebSocket & { isAlive?: boolean }) {
   this.isAlive = true;
 }
 
-const heartbeatTimer = setInterval(() => {
-  for (const ws of wss.clients) {
-    const sock = ws as WebSocket & { isAlive?: boolean };
-    if (sock.isAlive === false) {
-      console.log("Terminating unresponsive client");
+if (wss) {
+  wss.on("connection", (ws, req) => {
+    const clientId = req.headers["x-vesper-client"] as string | undefined;
+    const clientType = clientId === "v3sp3r-android" ? "vesper" : "unknown";
+
+    const client: ConnectedClient = {
+      ws,
+      type: clientType as "glasses" | "vesper" | "unknown",
+      connectedAt: Date.now(),
+    };
+    clients.set(ws, client);
+    (ws as WebSocket & { isAlive?: boolean }).isAlive = true;
+    ws.on("pong", heartbeat);
+
+    console.log(
+      `Client connected: ${client.type} (${clients.size} total) from ${req.socket.remoteAddress}`
+    );
+
+    ws.on("message", (data) => {
+      try {
+        const message: GlassesMessage = JSON.parse(data.toString());
+        handleMessage(ws, message);
+      } catch (e) {
+        console.warn("Invalid message:", (e as Error).message);
+      }
+    });
+
+    ws.on("close", () => {
       clients.delete(ws);
-      return ws.terminate();
-    }
-    sock.isAlive = false;
-    ws.ping();
-  }
-}, HEARTBEAT_INTERVAL_MS);
+      console.log(`Client disconnected (${clients.size} remaining)`);
+    });
 
-wss.on("close", () => clearInterval(heartbeatTimer));
+    ws.on("error", (err) => {
+      console.error("WebSocket error:", err.message);
+      clients.delete(ws);
+    });
 
-wss.on("connection", (ws, req) => {
-  const clientId = req.headers["x-vesper-client"] as string | undefined;
-  const clientType = clientId === "v3sp3r-android" ? "vesper" : "unknown";
-
-  const client: ConnectedClient = {
-    ws,
-    type: clientType as "glasses" | "vesper" | "unknown",
-    connectedAt: Date.now(),
-  };
-  clients.set(ws, client);
-  (ws as WebSocket & { isAlive?: boolean }).isAlive = true;
-  ws.on("pong", heartbeat);
-
-  console.log(
-    `Client connected: ${client.type} (${clients.size} total) from ${req.socket.remoteAddress}`
-  );
-
-  ws.on("message", (data) => {
-    try {
-      const message: GlassesMessage = JSON.parse(data.toString());
-      handleMessage(ws, message);
-    } catch (e) {
-      console.warn("Invalid message:", (e as Error).message);
-    }
+    ws.send(
+      JSON.stringify({
+        type: "STATUS_UPDATE",
+        text: "Connected to V3SP3R Glasses Bridge",
+        metadata: {
+          glasses_connected: getGlassesClients().length.toString(),
+          vesper_connected: getVesperClients().length.toString(),
+        },
+      } satisfies GlassesMessage)
+    );
   });
-
-  ws.on("close", () => {
-    clients.delete(ws);
-    console.log(`Client disconnected (${clients.size} remaining)`);
-  });
-
-  ws.on("error", (err) => {
-    console.error("WebSocket error:", err.message);
-    clients.delete(ws);
-  });
-
-  ws.send(
-    JSON.stringify({
-      type: "STATUS_UPDATE",
-      text: "Connected to V3SP3R Glasses Bridge",
-      metadata: {
-        glasses_connected: getGlassesClients().length.toString(),
-        vesper_connected: getVesperClients().length.toString(),
-      },
-    } satisfies GlassesMessage)
-  );
-});
+}
 
 function handleMessage(sender: WebSocket, message: GlassesMessage) {
   const client = clients.get(sender);
@@ -946,31 +954,33 @@ async function handleMentraResponse(session: any, message: GlassesMessage) {
   }
 }
 
-// Start MentraOS integration (non-blocking — falls back to relay-only mode)
-startMentraIntegration();
+if (!isTestEnv) {
+  // Start MentraOS integration (non-blocking — falls back to relay-only mode)
+  startMentraIntegration();
 
-// ==================== Health Check ====================
+  // ==================== Health Check ====================
 
-const HTTP_PORT = parseInt(process.env.HTTP_PORT || "8088", 10);
+  const HTTP_PORT = parseInt(process.env.HTTP_PORT || "8088", 10);
 
-const httpServer = createServer((req, res) => {
-  if (req.url === "/health") {
-    res.writeHead(200, { "Content-Type": "application/json" });
-    res.end(
-      JSON.stringify({
-        status: "ok",
-        glasses: getGlassesClients().length,
-        vesper: getVesperClients().length,
-        mentra: !!process.env.MENTRA_API_KEY,
-        uptime: process.uptime(),
-      })
-    );
-  } else {
-    res.writeHead(404);
-    res.end();
-  }
-});
+  const httpServer = createServer((req, res) => {
+    if (req.url === "/health") {
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(
+        JSON.stringify({
+          status: "ok",
+          glasses: getGlassesClients().length,
+          vesper: getVesperClients().length,
+          mentra: !!process.env.MENTRA_API_KEY,
+          uptime: process.uptime(),
+        })
+      );
+    } else {
+      res.writeHead(404);
+      res.end();
+    }
+  });
 
-httpServer.listen(HTTP_PORT, () => {
-  console.log(`Health check on port ${HTTP_PORT}`);
-});
+  httpServer.listen(HTTP_PORT, () => {
+    console.log(`Health check on port ${HTTP_PORT}`);
+  });
+}
